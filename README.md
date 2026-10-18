@@ -45,3 +45,11 @@ or put it behind a reverse proxy such as Caddy for HTTPS on a domain.
 ## Adding a font
 Drop a `.ttf` into `app/fonts/` and add a line to `FONT_CATALOG` in `app/renderer.py`.
 Only use fonts whose licence allows commercial use.
+
+## Licence
+The code is released under the [MIT License](LICENSE): anyone may use, change and share it,
+as long as the copyright notice stays, and it comes with no warranty.
+
+The handwriting fonts in `app/fonts/` keep their own open licences (SIL Open Font License 1.1
+or Apache 2.0) — see [app/fonts/LICENSES.md](app/fonts/LICENSES.md). They may be bundled and
+used commercially, but not sold on their own.
