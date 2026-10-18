@@ -1,0 +1,13 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime data (uploaded fonts and editor images) — lives on the server, not in git
+data/
+
+# Local test output
+samples/
+
+# macOS
+.DS_Store
