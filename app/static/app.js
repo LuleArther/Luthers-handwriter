@@ -78,12 +78,13 @@
   let customFontIds = [];
   let shapes = {};
   let scriptFilter = "all", langFilter = "all", fontQuery = "";
-  let preview = { images: [], page: 0 };
+  let preview = { images: [], page: 0, linesPerPage: 0 };
   let inflight = null, renderTimer = null, saveTimer = null;
   let coverageDismissedFor = "", showAllCoverage = false;
   let savedRange = null;
   let activeShape = null;
   let selectedShape = -1;  // index into shapes[preview.page]
+  let SHAPE_LABELS = {};
 
   // ------------------------------------------------------------------ storage
   function loadSaved() {
@@ -627,6 +628,7 @@
     checkCoverage();
     updateToolbar();
     scheduleRender(800);
+    renderEditorShapes();
   }
 
   // -- tables
@@ -1063,11 +1065,20 @@
   function buildShapes() {
     const labels = { circle: "Circle", box: "Box", underline: "Underline", arrow: "Arrow", check: "Tick", cross: "Cross",
       star: "Star", scribble: "Scribble", highlight: "Highlight" };
+    SHAPE_LABELS = labels;
+    const pick = (t) => { activeShape = activeShape === t ? null : t; selectedShape = -1; updateShapeUi(); };
     $("shape-picker").replaceChildren(...options.shapes.map((t) => el("button", {
       type: "button", class: "shape-btn", "data-shape": t, title: labels[t],
       html: `<svg viewBox="0 0 24 24">${SHAPE_ICONS[t] || ""}</svg><span>${labels[t] || t}</span>`,
-      onclick: () => { activeShape = activeShape === t ? null : t; updateShapeUi(); },
+      onclick: () => pick(t),
     })));
+    $("tb-shapes").replaceChildren(...options.shapes.map((t) => el("button", {
+      type: "button", "data-shape": t, title: `Add ${labels[t].toLowerCase()} — then click on the page`, "aria-label": `Add ${labels[t]}`,
+      html: `<svg viewBox="0 0 24 24">${SHAPE_ICONS[t] || ""}</svg>`,
+      onmousedown: (e) => e.preventDefault(), onclick: () => pick(t),
+    })));
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape" && activeShape) { activeShape = null; updateShapeUi(); } });
+    setupEditorPlacing();
     const color = $("shape-color");
     color.value = settings.ink_color;
     const syncColor = () => document.querySelector(".shape-color").style.setProperty("--shape-color", color.value);
@@ -1092,7 +1103,9 @@
       return { x: clamp((e.clientX - r.left) / r.width, 0, 1), y: clamp((e.clientY - r.top) / r.height, 0, 1), r };
     };
     frame.addEventListener("pointerdown", (e) => {
-      if (!canPlaceShapes() || e.target.closest(".zoom-btn, .shape-hit") || e.button !== 0) return;
+      if (e.target.closest(".zoom-btn, .shape-hit") || e.button !== 0) return;
+      if (!activeShape) { flashShapeHint("Pick a shape first (Circle, Box, Tick …), then click on the page."); return; }
+      if (!canPlaceShapes()) return;
       e.preventDefault();
       try { frame.setPointerCapture(e.pointerId); } catch { /* not all pointers can be captured */ }
       start = point(e);
@@ -1101,29 +1114,15 @@
       if (!start) return;
       const p = point(e);
       const fr = frame.getBoundingClientRect();
-      Object.assign(draft.style, {
-        left: `${Math.min(start.x, p.x) * p.r.width + p.r.left - fr.left}px`, top: `${Math.min(start.y, p.y) * p.r.height + p.r.top - fr.top}px`,
-        width: `${Math.abs(p.x - start.x) * p.r.width}px`, height: `${Math.abs(p.y - start.y) * p.r.height}px`,
-      });
-      draft.hidden = false;
+      const px = (q) => ({ x: q.x * p.r.width + p.r.left - fr.left, y: q.y * p.r.height + p.r.top - fr.top });
+      draft.innerHTML = svgShape({ type: activeShape, color: $("shape-color").value }, px(start), px(p));
     });
     frame.addEventListener("pointerup", (e) => {
       if (!start) return;
-      const p = point(e);
-      draft.hidden = true;
-      let { x: x1, y: y1 } = start, { x: x2, y: y2 } = p;
+      const p = point(e), start0 = start;
+      draft.innerHTML = "";
       start = null;
-      if (Math.hypot((x2 - x1) * 210, (y2 - y1) * 297) < 3) {  // a click, not a drag: use a default size
-        const [dw, dh] = SHAPE_DEFAULT[activeShape];
-        if (activeShape === "arrow") { x2 = x1 + dw; y2 = y1 + dh; }
-        else { x1 -= dw / 2; x2 = x1 + dw; y1 -= dh / 2; y2 = y1 + dh; }
-      }
-      (shapes[preview.page] ||= []).push({
-        type: activeShape, x1, y1, x2, y2, color: activeShape === "highlight" ? null : $("shape-color").value,
-      });
-      selectedShape = -1;
-      shapesChanged();
-      flashShapeHint(`${activeShape[0].toUpperCase() + activeShape.slice(1)} added ✓ — click it later to select or delete it.`);
+      addShape(preview.page, start0.x, start0.y, p.x, p.y);
     });
     updateShapeUi();
   }
@@ -1148,6 +1147,108 @@
     clearTimeout(hintTimer);
     hintTimer = setTimeout(() => { $("shape-hint").classList.remove("ok"); updateShapeUi(); }, 3500);
   }
+  // ---- shapes on the big editor paper
+  // The editor is one long sheet; the renderer splits it into pages of `linesPerPage` ruled lines.
+  // These two functions convert between editor pixels and (page, fraction-of-page) coordinates.
+  function editorGeom() {
+    const [pw, ph] = pageMm();
+    const s = editor.clientWidth / pw;
+    const L = settings.font_size * settings.line_height * s / 4;
+    const cap = preview.linesPerPage || Math.max(1, Math.floor((ph - settings.margin_top - settings.margin_bottom) * s / L) - 1);
+    return { pw, ph, s, L, pt: settings.margin_top * s, cap, pages: Math.max(1, preview.images.length) };
+  }
+  function editorToPage(x, y, g, page = null) {
+    if (page === null) page = clamp(Math.floor(Math.max(0, (y - g.pt) / g.L) / g.cap), 0, g.pages - 1);
+    const yMm = (y - g.pt - page * g.cap * g.L) / g.s + settings.margin_top;
+    return { page, x: clamp(x / g.s / g.pw, 0, 1), y: clamp(yMm / g.ph, 0, 1) };
+  }
+  const pageToEditor = (page, fx, fy, g) => ({ x: fx * g.pw * g.s, y: g.pt + page * g.cap * g.L + (fy * g.ph - settings.margin_top) * g.s });
+
+  function svgShape(sh, a, b) {
+    const color = sh.type === "highlight" ? "#ffe24d" : sh.color || settings.ink_color;
+    const lx = Math.min(a.x, b.x), rx = Math.max(a.x, b.x), ty = Math.min(a.y, b.y), by = Math.max(a.y, b.y);
+    const w = Math.max(rx - lx, 6), h = Math.max(by - ty, 6), cx = lx + w / 2, cy = ty + h / 2;
+    const st = `fill="none" stroke="${esc(color)}" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"`;
+    switch (sh.type) {
+      case "circle": return `<ellipse cx="${cx}" cy="${cy}" rx="${w / 2}" ry="${h / 2}" ${st}/>`;
+      case "box": return `<rect x="${lx}" y="${ty}" width="${w}" height="${h}" ${st}/>`;
+      case "underline": return `<path d="M${lx} ${ty + h} L${lx + w} ${ty + h}" ${st}/>`;
+      case "arrow": {
+        const ang = Math.atan2(b.y - a.y, b.x - a.x), head = Math.max(10, Math.hypot(b.x - a.x, b.y - a.y) * 0.18);
+        const p1 = [b.x + head * Math.cos(ang + Math.PI - 0.45), b.y + head * Math.sin(ang + Math.PI - 0.45)];
+        const p2 = [b.x + head * Math.cos(ang + Math.PI + 0.45), b.y + head * Math.sin(ang + Math.PI + 0.45)];
+        return `<path d="M${a.x} ${a.y} L${b.x} ${b.y} M${p1} L${b.x} ${b.y} L${p2}" ${st}/>`;
+      }
+      case "check": return `<path d="M${lx} ${ty + h * 0.55} L${lx + w * 0.35} ${ty + h} L${lx + w} ${ty}" ${st}/>`;
+      case "cross": return `<path d="M${lx} ${ty} L${lx + w} ${ty + h} M${lx + w} ${ty} L${lx} ${ty + h}" ${st}/>`;
+      case "star": {
+        const r = Math.min(w, h) / 2;
+        const pts = [...Array(6)].map((_, i) => [cx + r * Math.cos(-Math.PI / 2 + i * 4 * Math.PI / 5), cy + r * Math.sin(-Math.PI / 2 + i * 4 * Math.PI / 5)]);
+        return `<path d="M${pts.join(" L")}" ${st}/>`;
+      }
+      case "scribble": {
+        const n = Math.max(3, Math.round(w / 8));
+        return `<path d="M${[...Array(n + 1)].map((_, i) => [lx + w * i / n, ty + (i % 2 ? h : 0)]).join(" L")}" ${st}/>`;
+      }
+      case "highlight": return `<rect x="${lx}" y="${ty}" width="${w}" height="${h}" fill="${color}" opacity=".5" style="mix-blend-mode:multiply"/>`;
+    }
+    return "";
+  }
+  function renderEditorShapes() {
+    const svg = $("editor-shapes");
+    if (!options || !editor.clientWidth) return;
+    const g = editorGeom();
+    svg.setAttribute("width", editor.offsetWidth);
+    svg.setAttribute("height", editor.offsetHeight);
+    let out = "";
+    for (const [page, list] of Object.entries(shapes)) {
+      for (const sh of list || []) {
+        out += svgShape(sh, pageToEditor(+page, sh.x1, sh.y1, g), pageToEditor(+page, sh.x2, sh.y2, g));
+      }
+    }
+    svg.innerHTML = out;
+    const place = $("editor-place");
+    place.style.width = `${editor.offsetWidth}px`;
+    place.style.height = `${editor.offsetHeight}px`;
+  }
+  function addShape(page, x1, y1, x2, y2) {
+    if (Math.hypot((x2 - x1) * 210, (y2 - y1) * 297) < 3) {  // a click, not a drag: use a default size
+      const [dw, dh] = SHAPE_DEFAULT[activeShape];
+      if (activeShape === "arrow") { x2 = x1 + dw; y2 = y1 + dh; }
+      else { x1 -= dw / 2; x2 = x1 + dw; y1 -= dh / 2; y2 = y1 + dh; }
+    }
+    (shapes[page] ||= []).push({ type: activeShape, x1, y1, x2, y2, color: activeShape === "highlight" ? null : $("shape-color").value });
+    selectedShape = -1;
+    shapesChanged();
+    const label = SHAPE_LABELS[activeShape] || activeShape;
+    flashShapeHint(`${label} added ✓ on page ${page + 1} — click it on the preview to select or delete it.`);
+    editorStatus(`${label} added on page ${page + 1}. Keep clicking to add more, or press Esc to stop.`, false, 0);
+  }
+  function setupEditorPlacing() {
+    const place = $("editor-place"), draft = $("editor-draft");
+    let start = null;
+    const local = (e) => { const r = editor.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
+    place.addEventListener("pointerdown", (e) => {
+      if (!activeShape || e.button !== 0) return;
+      e.preventDefault();
+      try { place.setPointerCapture(e.pointerId); } catch { /* not all pointers can be captured */ }
+      start = local(e);
+    });
+    place.addEventListener("pointermove", (e) => {
+      if (!start) return;
+      draft.innerHTML = svgShape({ type: activeShape, color: $("shape-color").value }, start, local(e));
+    });
+    place.addEventListener("pointerup", (e) => {
+      if (!start) return;
+      const g = editorGeom();
+      const a = editorToPage(start.x, start.y, g), b = editorToPage(...Object.values(local(e)), g, a.page);
+      draft.innerHTML = "";
+      start = null;
+      addShape(a.page, a.x, a.y, b.x, b.y);
+    });
+    new ResizeObserver(renderEditorShapes).observe(editor);
+  }
+
   function renderShapeLayer() {
     const layer = $("shape-layer");
     const list = settings.output === "print" ? shapes[preview.page] || [] : [];
@@ -1165,6 +1266,13 @@
   function updateShapeUi() {
     if (!options) return;
     setPressed($("shape-picker"), "data-shape", activeShape);
+    setPressed($("tb-shapes"), "data-shape", activeShape);
+    const wasPlacing = !$("editor-place").hidden;
+    $("editor-place").hidden = !activeShape;
+    if (activeShape && !wasPlacing) {
+      editorStatus(`Click or drag on the page to add a ${(SHAPE_LABELS[activeShape] || activeShape).toLowerCase()}. Press Esc to stop.`, false, 0);
+    } else if (!activeShape && wasPlacing) editorStatus("");
+    renderEditorShapes();
     $("preview-frame").classList.toggle("placing", canPlaceShapes());
     const n = (shapes[preview.page] || []).length;
     renderShapeLayer();
@@ -1205,6 +1313,7 @@
       if (!res.ok) throw new Error(await errorMessage(res));
       const data = await res.json();
       preview.images = data.images;
+      preview.linesPerPage = data.lines_per_page;
       preview.page = Math.min(preview.page, data.images.length - 1);
       showPage();
       const secs = ((performance.now() - started) / 1000).toFixed(1);
